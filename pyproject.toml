@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sourdough"
+version = "0.1.0"
+description = "Sourdough: Safe, strictly-validated SDK and `dough` CLI for Wallet by BudgetBakers CouchDB sync"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "certifi>=2024.8.30",
+    "rich>=13.9.0",
+    "typer>=0.15.0",
+]
+
+[project.scripts]
+dough = "sourdough.cli.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sourdough"]

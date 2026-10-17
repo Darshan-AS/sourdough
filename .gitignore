@@ -1,0 +1,18 @@
+# Virtual environment & Python build artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# IDE & OS metadata
+.history/
+.DS_Store
+
+# Sensitive local Wallet state, cache, and rollback journals
+.wallet_state.json
+.wallet_cache.json
+.wallet_journal.jsonl
+report_*.csv
