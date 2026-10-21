@@ -37,6 +37,7 @@ from sourdough.exceptions import (
     ConflictError,
     EntityNotFoundError,
     SchemaValidationError,
+    WalletError,
 )
 from sourdough.services.records import WalletService
 
@@ -472,6 +473,255 @@ class ServiceAndCliIntegrationTests(unittest.TestCase):
             self.assertEqual(run_cli(["-h"]), 0)
             self.assertEqual(run_cli(["help"]), 0)
             self.assertEqual(run_cli(["help", "record", "add"]), 0)
+            self.assertEqual(run_cli(["help", "transfer", "link"]), 0)
+            self.assertEqual(run_cli(["help", "transfer", "convert"]), 0)
+            self.assertEqual(run_cli(["help", "categories", "add"]), 0)
+            self.assertEqual(run_cli(["help", "labels", "add"]), 0)
+
+    def test_record_list_filters_and_local_cache(self) -> None:
+        r1 = self.service.add_record(
+            account_query="HDFC",
+            category_query="Groceries",
+            amount="250.00",
+            record_type="expense",
+            record_date="2026-01-05",
+            note="Milk and bread",
+            labels=["vacation"],
+        )
+        r2 = self.service.add_record(
+            account_query="Cash",
+            category_query="Groceries",
+            amount="1500.00",
+            record_type="income",
+            record_date="2026-01-15",
+            note="Cashback refund",
+        )
+        xfer = self.service.add_transfer(
+            from_account_query="HDFC",
+            to_account_query="Cash",
+            amount="500.00",
+            record_date="2026-01-20",
+            note="ATM withdrawal",
+        )
+
+        # Label & unlabeled filters
+        by_lbl = self.service.list_records(label_query="#vacation")
+        self.assertEqual([r["id"] for r in by_lbl], [r1["id"]])
+
+        unlabeled = self.service.list_records(unlabeled=True)
+        self.assertIn(r2["id"], [r["id"] for r in unlabeled])
+        self.assertNotIn(r1["id"], [r["id"] for r in unlabeled])
+
+        # Date range filter
+        jan_early = self.service.list_records(date_from="2026-01-01", date_to="2026-01-10")
+        self.assertEqual([r["id"] for r in jan_early], [r1["id"]])
+
+        # Amount filters
+        exact = self.service.list_records(exact_amount="250")
+        self.assertEqual([r["id"] for r in exact], [r1["id"]])
+        mid_range = self.service.list_records(min_amount="400", max_amount="600")
+        self.assertEqual({r["id"] for r in mid_range}, {xfer["outflowId"], xfer["inflowId"]})
+
+        # Type filters
+        only_exp = self.service.list_records(record_type_filter="expense")
+        self.assertEqual([r["id"] for r in only_exp], [r1["id"]])
+        only_inc = self.service.list_records(record_type_filter="income")
+        self.assertEqual([r["id"] for r in only_inc], [r2["id"]])
+        only_xfer = self.service.list_records(record_type_filter="transfer")
+        self.assertEqual({r["id"] for r in only_xfer}, {xfer["outflowId"], xfer["inflowId"]})
+
+        # Local record cache sync & query
+        self.service.sync_cache(include_records=True)
+        cached_rows = self.service.list_records(use_cache=True, limit=0)
+        self.assertEqual(len(cached_rows), 4)
+
+    def test_batch_update_incremental_labels_notes_and_transfer_sync(self) -> None:
+        self.service.add_label("Family")
+        self.service.add_label("Shared with BrotherMine")
+
+        rec1 = self.service.add_record(
+            account_query="HDFC",
+            category_query="Groceries",
+            amount="300",
+            note="Flight ticket",
+            labels=["vacation"],
+        )
+        rec2 = self.service.add_record(
+            account_query="HDFC",
+            category_query="Groceries",
+            amount="450",
+            note="Hotel stay",
+        )
+
+        batch_res = self.service.update_records(
+            [rec1["id"], rec2["id"]],
+            prepend_note="[Thailand Jan 2024] ",
+            append_note=" (verified)",
+            add_labels=["#Family", "Shared with BrotherMine"],
+            remove_labels=["vacation"],
+        )
+        self.assertEqual(len(batch_res["updatedIds"]), 2)
+
+        f1 = self.service.get_record(rec1["id"])
+        f2 = self.service.get_record(rec2["id"])
+        self.assertEqual(f1["note"], "[Thailand Jan 2024] Flight ticket (verified)")
+        self.assertEqual(f2["note"], "[Thailand Jan 2024] Hotel stay (verified)")
+        self.assertEqual(set(f1["labels"]), {"Family", "Shared with BrotherMine"})
+        self.assertEqual(set(f2["labels"]), {"Family", "Shared with BrotherMine"})
+
+        # Paired transfer leg auto-sync on update
+        xfer = self.service.add_transfer(
+            from_account_query="HDFC",
+            to_account_query="Cash",
+            amount="1000",
+            note="Initial note",
+        )
+        upd_xfer = self.service.update_record(
+            xfer["outflowId"],
+            amount="1200",
+            prepend_note="[Synced] ",
+            payee="IndMoney",
+            add_labels=["Family"],
+        )
+        self.assertEqual(set(upd_xfer["updatedIds"]), {xfer["outflowId"], xfer["inflowId"]})
+        inflow_after = self.service.get_record(xfer["inflowId"])
+        self.assertEqual(inflow_after["signedAmount"], 1200.0)
+        self.assertEqual(inflow_after["note"], "[Synced] Initial note")
+        self.assertEqual(inflow_after["payee"], "IndMoney")
+        self.assertEqual(inflow_after["labels"], ["Family"])
+
+    def test_transfer_link_and_convert_with_undo(self) -> None:
+        # 1. Link two existing standalone records (passed inflow-first to verify auto-orientation)
+        inflow_rec = self.service.add_record(
+            account_query="Cash",
+            category_query="Groceries",
+            amount="2000",
+            record_type="income",
+            note="Unlinked cash deposit",
+        )
+        outflow_rec = self.service.add_record(
+            account_query="HDFC",
+            category_query="Groceries",
+            amount="2000",
+            record_type="expense",
+            note="Unlinked bank withdrawal",
+        )
+
+        linked = self.service.link_transfer(
+            inflow_rec["id"],
+            outflow_rec["id"],
+            note="Linked ATM transfer",
+        )
+        self.assertEqual(linked["outflowId"], outflow_rec["id"])
+        self.assertEqual(linked["inflowId"], inflow_rec["id"])
+
+        out_doc = self.service.get_record(outflow_rec["id"])
+        in_doc = self.service.get_record(inflow_rec["id"])
+        self.assertTrue(out_doc["transfer"])
+        self.assertTrue(in_doc["transfer"])
+        self.assertEqual(out_doc["transferId"], linked["transferId"])
+        self.assertEqual(out_doc["document"]["transferAccountId"], CASH_ACC_ID)
+        self.assertEqual(in_doc["document"]["transferAccountId"], HDFC_ACC_ID)
+
+        # 2. Convert a single-leg expense into a paired cross-currency transfer (HDFC INR -> Thai Cash THB)
+        single_exp = self.service.add_record(
+            account_query="HDFC",
+            category_query="Groceries",
+            amount="10000",
+            record_type="expense",
+            note="Forex load",
+            payee="OrientExchange",
+        )
+        converted = self.service.convert_to_transfer(
+            single_exp["id"],
+            target_account_query="Thai Cash",
+            target_amount="4000",
+            allow_bank_connected=True,
+        )
+        mirror_id = converted["mirrorId"]
+        mirror_doc = self.service.get_record(mirror_id)
+        self.assertEqual(mirror_doc["account"], "Thai Cash")
+        self.assertEqual(mirror_doc["signedAmount"], 4000.0)
+        self.assertEqual(mirror_doc["payee"], "OrientExchange")
+        self.assertEqual(mirror_doc["transferId"], converted["transferId"])
+
+        # 3. Undo the conversion -> restores single_exp to non-transfer Groceries AND deletes mirror_id!
+        undo_res = self.service.undo_last(entry_id=converted["journalEntryId"][:8])
+        self.assertIn(single_exp["id"], undo_res["revertedIds"])
+        self.assertIn(mirror_id, undo_res["revertedIds"])
+
+        restored_exp = self.service.get_record(single_exp["id"])
+        self.assertFalse(restored_exp["transfer"])
+        self.assertEqual(restored_exp["category"], "Groceries")
+        with self.assertRaises(EntityNotFoundError):
+            self.service.get_record(mirror_id)
+
+    def test_category_and_label_crud_and_hierarchy_resolution(self) -> None:
+        # Seed a -Configure_ document with hidden_envelopes containing 1001
+        cfg_id = "-Configure_99999999-0000-4000-8000-000000000001"
+        self.server.docs[cfg_id] = {
+            "_id": cfg_id,
+            "_rev": "1-cfg",
+            "hidden_envelopes": "1001,1002",
+            "reservedModelType": "Configure",
+        }
+        # Seed built-in 1001 category
+        rest_cat_id = "-Category_30000000-0000-4000-8000-000000001001"
+        self.server.docs[rest_cat_id] = {
+            "_id": rest_cat_id,
+            "_rev": "1-rest",
+            "name": "",
+            "envelopeId": 1001,
+            "customCategory": False,
+            "reservedModelType": "Category",
+        }
+        self.service.sync_cache()
+
+        # Add custom subcategory under 1001 -> automatically unhides 1001 in -Configure_
+        added_cat = self.service.add_category("Meals & Fast Food", parent_query="1001")
+        self.assertEqual(added_cat["envelopeId"], 1001)
+        self.assertEqual(self.server.docs[cfg_id]["hidden_envelopes"], "1002")
+
+        # Resolve using Parent > Child syntax
+        resolved_by_id = self.service.resolver.resolve_category("1001 > Meals & Fast Food")
+        resolved_by_name = self.service.resolver.resolve_category(
+            "Restaurant, fast-food > Meals & Fast Food"
+        )
+        self.assertEqual(resolved_by_id.doc_id, added_cat["id"])
+        self.assertEqual(resolved_by_name.doc_id, added_cat["id"])
+
+        # Rename & move category
+        renamed = self.service.rename_category(added_cat["id"], "Quick Meals")
+        self.assertEqual(renamed["newName"], "Quick Meals")
+        moved = self.service.move_category(added_cat["id"], parent_query="1000")
+        self.assertEqual(moved["newEnvelopeId"], 1000)
+
+        # Attach a record to Quick Meals, verify delete blocks without move_records_to, then migrates with move_records_to
+        rec = self.service.add_record(
+            account_query="Cash",
+            category_query="Quick Meals",
+            amount="120",
+        )
+        with self.assertRaises(WalletError):
+            self.service.delete_category("Quick Meals")
+
+        del_cat = self.service.delete_category("Quick Meals", move_records_to="Groceries")
+        self.assertEqual(del_cat["migratedRecordCount"], 1)
+        self.assertEqual(self.service.get_record(rec["id"])["category"], "Groceries")
+
+        # Label lifecycle: add, rename, delete (with guard and --force)
+        lbl = self.service.add_label("#TripTag")
+        self.assertEqual(lbl["name"], "TripTag")
+        self.service.update_record(rec["id"], add_labels=["TripTag"])
+        self.service.rename_label("TripTag", "HolidayTag")
+        self.assertIn("HolidayTag", self.service.get_record(rec["id"])["labels"])
+
+        with self.assertRaises(WalletError):
+            self.service.delete_label("HolidayTag", force=False)
+        del_lbl = self.service.delete_label("HolidayTag", force=True)
+        self.assertEqual(del_lbl["detachedRecordCount"], 1)
+        self.assertEqual(self.service.get_record(rec["id"])["labels"], [])
+        self.assertEqual(len(self.service.list_journal(limit=5)), 5)
 
 
 if __name__ == "__main__":

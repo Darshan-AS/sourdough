@@ -28,30 +28,53 @@ A strictly validated Python SDK (`sourdough`) and CLI (`dough`) for programmatic
 # Check database status and paths
 ./dough auth status
 
-# Refresh local metadata cache (Accounts, Categories, Currencies, Labels)
+# Refresh local metadata cache (and optionally cache all Record_ docs locally via --records)
 ./dough sync-cache
+./dough sync-cache --records
 
-# List accounts and categories
+# List & manage accounts, categories, and labels
 ./dough accounts
 ./dough categories --search "food"
+./dough categories add "Meals & Fast Food" --parent "1001"
+./dough categories rename "6009" "Holiday, trips, hotels"
+./dough categories move "Auto" --parent "4001"
+./dough categories delete "EmptySubcat" --move-to "1001 > Meals & Fast Food"
+
+./dough labels
+./dough labels add "Family" --color "#26c6da"
+./dough labels rename "Family" "Family Support"
+./dough labels delete "UnusedLabel"
 
 # Preview creating a record (--dry-run)
 ./dough record add --account "Cash" --amount 1000 --category "Groceries" --note "Test" --dry-run
 
-# Create an expense or income record
-./dough record add --account "Cash" --amount 1000 --category "Groceries" --note "Gemini Argon test"
+# Create an expense or income record (supports Parent > Child category resolution)
+./dough record add --account "Cash" --amount 1000 --category "1001 > Meals & Fast Food" --note "Dinner"
 
-# List recent records (or pass --json for agent/script usage)
-./dough record list --account "Cash" --limit 10
-./dough record list --limit 5 --json
+# Rich filtering on records (date range, labels, amount, type, and instant local --cached mode)
+./dough record list --account "HDFC" --from 2023-12-20 --to 2024-01-15 --label "Family" --cached
+./dough record list --type unlinked-transfer --limit 50
+./dough record list --amount 395 --json
 
-# Update, delete, or undo the most recent mutation
-./dough record update Record_<uuid> --amount 1200 --note "Updated note"
+# Single or batch update with incremental label & note flags (auto-syncs paired transfer legs)
+./dough record update Record_<uuid1> Record_<uuid2> \
+  --category "6009" \
+  --add-label "Family" \
+  --add-label "Shared with BrotherMine" \
+  --prepend-note "[Thailand Jan 2024] "
+
+# Delete a record (and its paired transfer leg if applicable)
 ./dough record delete Record_<uuid>
-./dough record undo
 
-# Create a paired transfer between two accounts
+# Inspect mutation journal and undo the last mutation (or a specific batch via --id)
+./dough journal --limit 10
+./dough record undo
+./dough record undo --id <journal_entry_prefix>
+
+# Create, link, or convert paired transfers between accounts
 ./dough transfer add --from "HDFC" --to "Cash" --amount 2000 --note "ATM Withdrawal"
+./dough transfer link Record_<outflow_uuid> Record_<inflow_uuid> --note "Credit Card Bill"
+./dough transfer convert Record_<single_leg_uuid> --to "Investments" --payee "IndMoney"
 ```
 
 ## Running Tests

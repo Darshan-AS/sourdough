@@ -38,13 +38,16 @@ class EntityResolver:
     def resolve_currency(self, query: str) -> CurrencyDocument:
         return self._with_fallback_refresh(lambda snap: self._find_currency(snap, query))
 
+    def resolve_label(self, query: str) -> LabelDocument:
+        return self._with_fallback_refresh(lambda snap: self._find_label(snap, query))
+
     def resolve_labels(self, queries: Iterable[str]) -> tuple[str, ...]:
         q_list = [q.strip() for q in queries if q and q.strip()]
         if not q_list:
             return ()
         resolved: list[str] = []
         for q in q_list:
-            lbl = self._with_fallback_refresh(lambda snap, q=q: self._find_label(snap, q))
+            lbl = self.resolve_label(q)
             if lbl.doc_id not in resolved:
                 resolved.append(lbl.doc_id)
         return tuple(resolved)
@@ -87,6 +90,54 @@ class EntityResolver:
         for cat in snap.categories:
             if cat.doc_id == q or cat.doc_id == f"-Category_{q}":
                 return cat
+
+        if ">" in q:
+            parent_q, child_q = [p.strip() for p in q.split(">", 1)]
+            if not parent_q or not child_q:
+                raise EntityNotFoundError(f"Invalid hierarchical category query {query!r}")
+            parent_env_ids: set[int] = set()
+            if parent_q.isdigit():
+                parent_env_ids.add(int(parent_q))
+            else:
+                for c in snap.categories:
+                    if (
+                        c.display_name.lower() == parent_q.lower()
+                        or c.name.lower() == parent_q.lower()
+                        or parent_q.lower() in c.display_name.lower()
+                    ):
+                        parent_env_ids.add(c.envelope_id)
+            scoped = [c for c in snap.categories if c.envelope_id in parent_env_ids]
+            exact_child = [
+                c
+                for c in scoped
+                if c.display_name.lower() == child_q.lower()
+                or c.name.lower() == child_q.lower()
+            ]
+            if len(exact_child) == 1:
+                return exact_child[0]
+            if len(exact_child) > 1:
+                custom_child = [c for c in exact_child if c.custom_category]
+                if len(custom_child) == 1:
+                    return custom_child[0]
+            partial_child = [
+                c
+                for c in scoped
+                if child_q.lower() in c.display_name.lower()
+                or child_q.lower() in c.name.lower()
+            ]
+            if len(partial_child) == 1:
+                return partial_child[0]
+            if len(partial_child) > 1:
+                options = ", ".join(
+                    f"{c.display_name!r} ({c.doc_id}, envelope={c.envelope_id})"
+                    for c in partial_child
+                )
+                raise AmbiguousEntityError(
+                    f"Multiple categories match {query!r}: {options}"
+                )
+            raise EntityNotFoundError(
+                f"Subcategory {child_q!r} under {parent_q!r} not found."
+            )
 
         if q.isdigit():
             env_id = int(q)
@@ -161,7 +212,15 @@ class EntityResolver:
     @staticmethod
     def _find_label(snap: MetadataSnapshot, query: str) -> LabelDocument:
         q = query.strip()
+        if q.startswith("#") and len(q) > 1:
+            q = q[1:].strip()
         for lbl in snap.labels:
             if lbl.doc_id == q or lbl.doc_id == f"-HashTag_{q}" or lbl.name.lower() == q.lower():
                 return lbl
+        partial = [lbl for lbl in snap.labels if q.lower() in lbl.name.lower()]
+        if len(partial) == 1:
+            return partial[0]
+        if len(partial) > 1:
+            options = ", ".join(f"{l.name!r} ({l.doc_id})" for l in partial)
+            raise AmbiguousEntityError(f"Multiple labels match {query!r}: {options}")
         raise EntityNotFoundError(f"Label {query!r} not found")

@@ -93,6 +93,23 @@ class MutationJournal:
                 return entry
         return None
 
+    def get_entry(self, entry_id: str) -> JournalEntry:
+        """Resolve a journal entry by exact entry_id or unambiguous prefix."""
+        q = entry_id.strip()
+        if not q:
+            raise WalletError("Journal entry ID cannot be empty")
+        entries = self.list_entries()
+        exact = [e for e in entries if e.entry_id == q]
+        if len(exact) == 1:
+            return exact[0]
+        prefix = [e for e in entries if e.entry_id.startswith(q)]
+        if len(prefix) == 1:
+            return prefix[0]
+        if len(prefix) > 1:
+            matches = ", ".join(e.entry_id for e in prefix[:5])
+            raise WalletError(f"Ambiguous journal entry prefix {entry_id!r}; matches: {matches}")
+        raise WalletError(f"Journal entry {entry_id!r} not found")
+
     def mark_undone(self, entry_id: str) -> None:
         entries = self.list_entries()
         updated: list[JournalEntry] = []
