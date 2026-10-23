@@ -253,8 +253,81 @@ class WalletService:
         return None
 
     # -------------------------------------------------------------------------
-    # Label Management (CRUD)
+    # Currency & Label Management (CRUD)
     # -------------------------------------------------------------------------
+
+    def add_currency(
+        self,
+        code: str,
+        ratio_to_referential: float,
+        *,
+        position: int = 3000,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Create a new -Currency_<uuid> document in CouchDB."""
+        clean_code = code.strip().upper()
+        if len(clean_code) != 3 or not clean_code.isalpha():
+            raise SchemaValidationError(f"Currency code must be a 3-letter ISO code, got {code!r}")
+        if ratio_to_referential <= 0:
+            raise SchemaValidationError(f"ratio_to_referential must be > 0, got {ratio_to_referential!r}")
+
+        snap = self.cache.get_snapshot(force_refresh=not dry_run)
+        for existing in snap.currencies:
+            if existing.code.upper() == clean_code:
+                return {
+                    "dryRun": dry_run,
+                    "operation": "CURRENCY_EXISTS",
+                    "id": existing.doc_id,
+                    "code": existing.code,
+                    "ratioToReferential": existing.ratio_to_referential,
+                }
+
+        now_iso = utc_now_iso()
+        doc_id = f"-Currency_{uuid.uuid4()}"
+        payload: dict[str, Any] = {
+            "_id": doc_id,
+            "code": clean_code,
+            "referential": False,
+            "ratioToReferential": float(ratio_to_referential),
+            "position": int(position),
+            "reservedModelType": "Currency",
+            "reservedOwnerId": self.replication.owner_id,
+            "reservedAuthorId": self.replication.owner_id,
+            "reservedCreatedAt": now_iso,
+            "reservedUpdatedAt": now_iso,
+            "reservedSource": "android",
+        }
+        CurrencyDocument.from_couch_dict(payload)
+
+        if dry_run:
+            return {
+                "dryRun": True,
+                "operation": "CURRENCY_CREATE",
+                "id": doc_id,
+                "code": clean_code,
+                "ratioToReferential": float(ratio_to_referential),
+                "document": payload,
+            }
+
+        put_res = self.client.put_doc(payload)
+        saved_doc = dict(payload)
+        saved_doc["_rev"] = put_res.get("rev")
+        journal_entry = self.journal.record(
+            operation="CREATE",
+            before_docs=[],
+            after_docs=[saved_doc],
+        )
+        self.cache.refresh()
+        return {
+            "dryRun": False,
+            "operation": "CURRENCY_CREATE",
+            "id": doc_id,
+            "rev": put_res.get("rev"),
+            "code": clean_code,
+            "ratioToReferential": float(ratio_to_referential),
+            "journalEntryId": journal_entry.entry_id,
+            "document": saved_doc,
+        }
 
     def add_label(
         self,
@@ -1592,6 +1665,11 @@ class WalletService:
                             pair_rec,
                             amount=pair_amount,
                             ref_amount=pair_ref,
+                            transfer_account_id=(
+                                new_account_id
+                                if resolved_account is not None
+                                else pair_rec.transfer_account_id
+                            ),
                             record_date=(
                                 resolved_date
                                 if resolved_date is not None

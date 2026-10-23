@@ -95,6 +95,7 @@ def build_record(
     currency: CurrencyDocument,
     category: CategoryDocument,
     amount_major: NumericAmount,
+    ref_amount_major: NumericAmount | None = None,
     record_type: RecordType = RecordType.EXPENSE,
     payment_type: PaymentType = PaymentType.CASH,
     record_state: RecordState = RecordState.CLEARED,
@@ -104,11 +105,7 @@ def build_record(
     labels: Iterable[str] | None = None,
     record_id: str | None = None,
 ) -> RecordDocument:
-    """Construct a validated RecordDocument pinned to the account's currency."""
-    if account.currency_id != currency.doc_id:
-        raise SchemaValidationError(
-            f"Currency {currency.doc_id} does not match account {account.name!r} currency {account.currency_id}"
-        )
+    """Construct a validated RecordDocument (supporting both account-currency and multi-currency records)."""
     if category.envelope_id == 8002 and record_type != RecordType.EXPENSE:
         raise SchemaValidationError(
             "Category 'Loan and Debts' (envelopeId=8002) is only valid for EXPENSE records (Me -> Person); "
@@ -123,7 +120,11 @@ def build_record(
     norm_date = normalize_timestamp_input(record_date) if record_date else now_iso
     doc_id = record_id or f"Record_{uuid.uuid4()}"
     amount_minor = decimal_to_minor_units(amount_major)
-    ref_minor = compute_ref_amount(amount_minor, currency)
+    ref_minor = (
+        decimal_to_minor_units(ref_amount_major)
+        if ref_amount_major is not None
+        else compute_ref_amount(amount_minor, currency)
+    )
 
     return RecordDocument(
         doc_id=doc_id,
