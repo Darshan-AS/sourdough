@@ -723,6 +723,121 @@ class ServiceAndCliIntegrationTests(unittest.TestCase):
         self.assertEqual(self.service.get_record(rec["id"])["labels"], [])
         self.assertEqual(len(self.service.list_journal(limit=5)), 5)
 
+    def test_debt_direction_leaf_category_and_transfer_matching(self) -> None:
+        # 1. Seed Loan and Debts (8002) and Lending, renting (10005)
+        loan_cat_id = "-Category_30000000-0000-4000-8000-000000008002"
+        lend_cat_id = "-Category_30000000-0000-4000-8000-000000010005"
+        rest_parent_id = "-Category_30000000-0000-4000-8000-000000001001"
+        self.server.docs[loan_cat_id] = {
+            "_id": loan_cat_id,
+            "_rev": "1-loan",
+            "name": "Loan and Debts",
+            "envelopeId": 8002,
+            "customCategory": False,
+            "reservedModelType": "Category",
+        }
+        self.server.docs[lend_cat_id] = {
+            "_id": lend_cat_id,
+            "_rev": "1-lend",
+            "name": "Lending, renting",
+            "envelopeId": 10005,
+            "customCategory": False,
+            "reservedModelType": "Category",
+        }
+        self.server.docs[rest_parent_id] = {
+            "_id": rest_parent_id,
+            "_rev": "1-rest",
+            "name": "Restaurants & fast food",
+            "envelopeId": 1001,
+            "customCategory": False,
+            "reservedModelType": "Category",
+        }
+        self.service.sync_cache()
+
+        # Verify direction guardrails for 8002 and 10005
+        with self.assertRaises(SchemaValidationError):
+            self.service.add_record(
+                account_query="HDFC",
+                category_query="Loan and Debts",
+                amount="500",
+                record_type="income",
+            )
+        with self.assertRaises(SchemaValidationError):
+            self.service.add_record(
+                account_query="HDFC",
+                category_query="Lending, renting",
+                amount="500",
+                record_type="expense",
+            )
+
+        # Valid directions succeed
+        exp_debt = self.service.add_record(
+            account_query="HDFC",
+            category_query="Loan and Debts",
+            amount="500",
+            record_type="expense",
+        )
+        inc_repay = self.service.add_record(
+            account_query="HDFC",
+            category_query="Lending, renting",
+            amount="500",
+            record_type="income",
+        )
+        self.assertEqual(exp_debt["document"]["type"], 1)
+        self.assertEqual(inc_repay["document"]["type"], 0)
+
+        # 2. Leaf category enforcement when custom subcategory exists under 1001
+        self.service.add_category("Meals & Fast Food", parent_query="1001")
+        with self.assertRaises(SchemaValidationError):
+            self.service.add_record(
+                account_query="HDFC",
+                category_query="Restaurants & fast food",
+                amount="250",
+            )
+        leaf_rec = self.service.add_record(
+            account_query="HDFC",
+            category_query="Meals & Fast Food",
+            amount="250",
+        )
+        self.assertEqual(leaf_rec["categoryName"], "Meals & Fast Food")
+
+        # 3. Open debt resolution and transfer pair matching
+        debt_id = "-Debt_99999999-1111-4222-8333-444444444444"
+        self.server.docs[debt_id] = {
+            "_id": debt_id,
+            "_rev": "1-debt",
+            "name": "BrotherMine",
+            "note": "Shared iPad EMI",
+            "amount": 3000000,
+            "remainingAmount": 1500000,
+            "paidBack": False,
+            "date": "2026-01-10T00:00:00.000Z",
+            "reservedModelType": "Debt",
+        }
+        open_debt = self.service.find_open_debt("BrotherMine")
+        self.assertIsNotNone(open_debt)
+        assert open_debt is not None
+        self.assertEqual(open_debt["_id"], debt_id)
+
+        xfer = self.service.add_transfer(
+            from_account_query="HDFC",
+            to_account_query="Cash",
+            amount="7322.29",
+            record_date="2026-03-14T12:00:00Z",
+            note="CC bill payment",
+        )
+        matched_pair = self.service.find_matching_transfer(
+            from_account_id=HDFC_ACC_ID,
+            to_account_id=CASH_ACC_ID,
+            amount_minor=732229,
+            date_iso="2026-03-15",
+            tolerance_days=2,
+        )
+        self.assertIsNotNone(matched_pair)
+        assert matched_pair is not None
+        self.assertEqual(matched_pair[0]["_id"], xfer["outflowId"])
+        self.assertEqual(matched_pair[1]["_id"], xfer["inflowId"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable, Sequence
 from dataclasses import replace
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 import uuid
@@ -139,6 +140,117 @@ class WalletService:
         if not include_archived:
             labels = [l for l in labels if not l.archived]
         return sorted(labels, key=lambda l: l.name.lower())
+
+    def list_debts(
+        self,
+        *,
+        person_query: str | None = None,
+        only_open: bool = False,
+    ) -> list[dict[str, Any]]:
+        """List -Debt_<uuid> documents in CouchDB, optionally filtered by person name/note or open state."""
+        raw_debts = self.client.all_docs_by_prefix("-Debt_")
+        q = person_query.strip().lower() if person_query else None
+        results: list[dict[str, Any]] = []
+        for raw in raw_debts:
+            if raw.get("_deleted") or raw.get("reservedModelType") != "Debt":
+                continue
+            paid_back = bool(raw.get("paidBack", False)) or bool(raw.get("forgiven", False))
+            if only_open and paid_back:
+                continue
+            name = str(raw.get("name", ""))
+            note = str(raw.get("note", ""))
+            if q and q not in name.lower() and q not in note.lower():
+                continue
+            results.append(
+                {
+                    "id": str(raw.get("_id", "")),
+                    "rev": str(raw.get("_rev", "")),
+                    "name": name,
+                    "note": note,
+                    "amount": int(raw.get("amount", 0)),
+                    "remainingAmount": int(raw.get("remainingAmount", 0)),
+                    "paidBack": paid_back,
+                    "date": str(raw.get("date", "")),
+                    "document": raw,
+                }
+            )
+        results.sort(key=lambda d: (d["date"], d["id"]), reverse=True)
+        return results
+
+    def find_open_debt(self, person_name: str) -> dict[str, Any] | None:
+        """Return the raw CouchDB document for the most recent open -Debt_<uuid> matching person_name."""
+        clean = person_name.strip().lower()
+        if not clean:
+            return None
+        open_debts = self.list_debts(person_query=person_name, only_open=True)
+        for item in open_debts:
+            if item["name"].strip().lower() == clean:
+                return dict(item["document"])
+        if open_debts:
+            return dict(open_debts[0]["document"])
+        return None
+
+    def find_matching_transfer(
+        self,
+        *,
+        from_account_id: str,
+        to_account_id: str,
+        amount_minor: int,
+        date_iso: str,
+        tolerance_days: int = 2,
+        raw_records: Sequence[dict[str, Any]] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Find an existing active paired transfer between from_account_id and to_account_id within tolerance_days."""
+        try:
+            target_dt = date.fromisoformat(date_iso[:10])
+        except ValueError:
+            return None
+
+        records = (
+            list(raw_records)
+            if raw_records is not None
+            else self.client.all_docs_by_prefix("Record_")
+        )
+        by_transfer_id: dict[str, list[dict[str, Any]]] = {}
+        outflow_candidates: list[tuple[int, dict[str, Any]]] = []
+
+        for raw in records:
+            if raw.get("_deleted") or raw.get("reservedModelType") != "Record":
+                continue
+            if not raw.get("transfer"):
+                continue
+            tid = str(raw.get("transferId") or "")
+            if tid:
+                by_transfer_id.setdefault(tid, []).append(raw)
+
+            if (
+                raw.get("accountId") == from_account_id
+                and raw.get("transferAccountId") == to_account_id
+                and int(raw.get("type", 1)) == int(RecordType.EXPENSE)
+                and int(raw.get("amount", 0)) == amount_minor
+            ):
+                rec_dt_str = str(raw.get("recordDate", ""))[:10]
+                try:
+                    rec_dt = date.fromisoformat(rec_dt_str)
+                except ValueError:
+                    continue
+                day_diff = abs((rec_dt - target_dt).days)
+                if day_diff <= tolerance_days:
+                    outflow_candidates.append((day_diff, raw))
+
+        outflow_candidates.sort(key=lambda pair: (pair[0], str(pair[1].get("recordDate", ""))))
+        for _diff, out_raw in outflow_candidates:
+            tid = str(out_raw.get("transferId") or "")
+            if not tid:
+                continue
+            for sibling in by_transfer_id.get(tid, ()):
+                if (
+                    sibling.get("_id") != out_raw.get("_id")
+                    and sibling.get("accountId") == to_account_id
+                    and int(sibling.get("type", 0)) == int(RecordType.INCOME)
+                ):
+                    return (dict(out_raw), dict(sibling))
+        return None
 
     # -------------------------------------------------------------------------
     # Label Management (CRUD)
@@ -671,7 +783,7 @@ class WalletService:
                 f"Account {account.name!r} is connected to a bank synchronization. "
                 "Pass allow_bank_connected=True (--allow-bank-connected) to override."
             )
-        category = self.resolver.resolve_category(category_query)
+        category = self.resolver.resolve_leaf_category(category_query)
         currency = self.resolver.resolve_currency(account.currency_id)
         label_ids = self.resolver.resolve_labels(labels or ())
 
@@ -1339,7 +1451,7 @@ class WalletService:
             else None
         )
         resolved_category = (
-            self.resolver.resolve_category(category_query)
+            self.resolver.resolve_leaf_category(category_query)
             if category_query is not None
             else None
         )

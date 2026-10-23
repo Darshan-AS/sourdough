@@ -16,3 +16,4 @@ build/
 .wallet_cache.json
 .wallet_journal.jsonl
 report_*.csv
+Acct_Statement_*

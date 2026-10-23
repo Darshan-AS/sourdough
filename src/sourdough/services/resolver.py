@@ -8,8 +8,14 @@ from sourdough.domain.models import (
     CurrencyDocument,
     LabelDocument,
 )
-from sourdough.exceptions import AmbiguousEntityError, EntityNotFoundError
+from sourdough.exceptions import (
+    AmbiguousEntityError,
+    EntityNotFoundError,
+    SchemaValidationError,
+)
 from sourdough.infra.cache import MetadataCache, MetadataSnapshot
+
+LEAF_REQUIRED_ENVELOPES: frozenset[int] = frozenset({1001, 1002, 4000, 8007})
 
 
 class EntityResolver:
@@ -31,6 +37,25 @@ class EntityResolver:
 
     def resolve_category(self, query: str) -> CategoryDocument:
         return self._with_fallback_refresh(lambda snap: self._find_category(snap, query))
+
+    def resolve_leaf_category(self, query: str) -> CategoryDocument:
+        """Resolve a category and enforce leaf subcategory selection for split parent envelopes."""
+        def _lookup(snap: MetadataSnapshot) -> CategoryDocument:
+            cat = self._find_category(snap, query)
+            if not cat.custom_category and cat.envelope_id in LEAF_REQUIRED_ENVELOPES:
+                children = [
+                    c for c in snap.categories
+                    if c.envelope_id == cat.envelope_id and c.custom_category
+                ]
+                if children:
+                    leaf_names = ", ".join(sorted(c.display_name for c in children))
+                    raise SchemaValidationError(
+                        f"Parent category {cat.display_name!r} (envelope={cat.envelope_id}) has active "
+                        f"leaf subcategories and cannot be used directly. Choose one of: {leaf_names}"
+                    )
+            return cat
+
+        return self._with_fallback_refresh(_lookup)
 
     def resolve_transfer_category(self) -> CategoryDocument:
         return self._with_fallback_refresh(self._find_transfer_category)
@@ -149,6 +174,12 @@ class EntityResolver:
             env_all = [c for c in snap.categories if c.envelope_id == env_id]
             if len(env_all) == 1:
                 return env_all[0]
+
+        exact_display = [
+            c for c in snap.categories if c.display_name.lower() == q.lower()
+        ]
+        if len(exact_display) == 1:
+            return exact_display[0]
 
         exact_ci = [
             c

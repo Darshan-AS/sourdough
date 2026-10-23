@@ -109,6 +109,16 @@ def build_record(
         raise SchemaValidationError(
             f"Currency {currency.doc_id} does not match account {account.name!r} currency {account.currency_id}"
         )
+    if category.envelope_id == 8002 and record_type != RecordType.EXPENSE:
+        raise SchemaValidationError(
+            "Category 'Loan and Debts' (envelopeId=8002) is only valid for EXPENSE records (Me -> Person); "
+            "use 'Lending, renting' (envelopeId=10005) for INCOME repayments."
+        )
+    if category.envelope_id == 10005 and record_type != RecordType.INCOME:
+        raise SchemaValidationError(
+            "Category 'Lending, renting' (envelopeId=10005) is only valid for INCOME records (Person -> Me); "
+            "use 'Loan and Debts' (envelopeId=8002) for EXPENSE lending."
+        )
     now_iso = utc_now_iso()
     norm_date = normalize_timestamp_input(record_date) if record_date else now_iso
     doc_id = record_id or f"Record_{uuid.uuid4()}"
